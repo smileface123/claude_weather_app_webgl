@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<title>Wetter – WebGL</title>
+<style>
+  html, body { margin:0; padding:0; overflow:hidden; width:100%; height:100%; background:#0b1220; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+  canvas#gl { display:block; position:fixed; top:0; left:0; z-index:0; }
+
+  #searchBar {
+    position:fixed; top:20px; left:50%; transform:translateX(-50%);
+    display:flex; gap:8px; z-index:10;
+    background:rgba(15,20,30,0.55);
+    backdrop-filter: blur(10px);
+    padding:8px; border-radius:14px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+  }
+  #searchBar input {
+    border:none; outline:none; background:rgba(255,255,255,0.12);
+    color:#fff; padding:10px 14px; border-radius:10px; font-size:14px;
+    width:220px;
+  }
+  #searchBar input::placeholder { color:rgba(255,255,255,0.55); }
+  #searchBar button {
+    border:none; outline:none; cursor:pointer;
+    background:#ffffff; color:#111; font-weight:600;
+    padding:10px 16px; border-radius:10px; font-size:14px;
+  }
+  #searchBar button:hover { background:#e8e8e8; }
+
+  #status {
+    position:fixed; top:70px; left:50%; transform:translateX(-50%);
+    color:rgba(255,255,255,0.7); font-size:13px; z-index:10;
+    pointer-events:none;
+  }
+
+  #overlay {
+    position:fixed; top:100px; left:0; right:0;
+    padding: 10px 32px;
+    color:#fff;
+    display:flex; justify-content:space-between; align-items:flex-start;
+    pointer-events:none;
+    text-shadow: 0 2px 12px rgba(0,0,0,0.35);
+    z-index:5;
+  }
+  #overlay .place { font-size:22px; font-weight:600; letter-spacing:0.5px; }
+  #overlay .cond { font-size:15px; font-weight:400; opacity:0.8; margin-top:4px; }
+  #overlay .temp { font-size:64px; font-weight:200; line-height:1; text-align:right; }
+  #overlay .range { font-size:14px; font-weight:400; opacity:0.8; text-align:right; margin-top:6px; }
+
+  #trend {
+    position:fixed; bottom:0; left:0; right:0;
+    padding: 18px 24px 22px;
+    background: linear-gradient(to top, rgba(5,8,14,0.65), rgba(5,8,14,0));
+    z-index:5;
+  }
+  #trend .label {
+    color:rgba(255,255,255,0.6); font-size:12px; letter-spacing:1px;
+    text-transform:uppercase; margin-bottom:8px;
+  }
+  #trendCanvas { width:100%; height:150px; display:block; }
+
+  #hint {
+    position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
+    color:rgba(255,255,255,0.7); font-size:15px; text-align:center; z-index:10;
+  }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div id="searchBar">
+  <input id="cityInput" type="text" placeholder="Ort eingeben, z.B. Karlsruhe" />
+  <button id="goBtn">Anzeigen</button>
+</div>
+<div id="status"></div>
+<div id="hint">Ort eingeben, um das Wetter zu laden</div>
+
+<div id="overlay" style="display:none;">
+  <div>
+    <div class="place" id="placeText"></div>
+    <div class="cond" id="condText"></div>
+  </div>
+  <div>
+    <div class="temp" id="tempText"></div>
+    <div class="range" id="rangeText"></div>
+  </div>
+</div>
+
+<div id="trend" style="display:none;">
+  <div class="label">7-Tage-Trend</div>
+  <canvas id="trendCanvas"></canvas>
+</div>
+
+<script>
+// ---------------- WebGL background ----------------
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl');
+
+function resize() {
+  canvas.width = window.innerWidth * Math.min(window.devicePixelRatio || 1, 2);
+  canvas.height = window.innerHeight * Math.min(window.devicePixelRatio || 1, 2);
+  canvas.style.width = window.innerWidth + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+  if (gl) gl.viewport(0, 0, canvas.width, canvas.height);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const vertSrc = `
+attribute vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+`;
+
+const fragSrc = `
+precision highp float;
+uniform vec2 uRes;
+uniform float uTime;
+uniform float uIsDay;
+uniform float uCloudCover;
+uniform float uTemp;
+
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453123); }
+float noise(vec2 p){
+  vec2 i = floor(p); vec2 f = fract(p);
+  float a = hash(i), b = hash(i+vec2(1.0,0.0)), c = hash(i+vec2(0.0,1.0)), d = hash(i+vec2(1.0,1.0));
+  vec2 u = f*f*(3.0-2.0*f);
+  return mix(a,b,u.x) + (c-a)*u.y*(1.0-u.x) + (d-b)*u.x*u.y;
+}
+float fbm(vec2 p){
+  float v = 0.0, amp = 0.5;
+  for(int i=0;i<5;i++){ v += amp*noise(p); p *= 2.02; amp *= 0.5; }
+  return v;
+}
+
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes.xy;
+  vec2 p = uv; p.x *= uRes.x / uRes.y;
+
+  float warmth = clamp((uTemp - 5.0) / 30.0, 0.0, 1.0);
+  vec3 skyTop = mix(vec3(0.10,0.22,0.45), vec3(0.30,0.55,0.85), uIsDay);
+  skyTop = mix(skyTop, skyTop + vec3(0.05,0.03,-0.05), warmth);
+  vec3 skyBottom = mix(vec3(0.55,0.70,0.88), vec3(0.80,0.85,0.86), uCloudCover);
+  skyBottom = mix(vec3(0.05,0.07,0.12), skyBottom, uIsDay);
+  vec3 col = mix(skyBottom, skyTop, pow(uv.y, 0.7));
+
+  vec2 sunPos = vec2(0.78, 0.78); sunPos.x *= uRes.x / uRes.y;
+  float d = distance(p, sunPos);
+  float sun = smoothstep(0.09, 0.0, d);
+  float glow = smoothstep(0.35, 0.0, d) * 0.5;
+  vec3 sunColor = mix(vec3(0.85,0.88,1.0), vec3(1.0,0.95,0.78), uIsDay);
+  col += sunColor * (sun*1.2 + glow*0.5) * (0.3 + 0.7*uIsDay);
+
+  if (uIsDay < 0.5) {
+    vec2 starUv = floor(p * 120.0);
+    float s = hash(starUv);
+    float star = step(0.996, s) * (0.5 + 0.5*sin(uTime*2.0 + s*100.0));
+    col += vec3(star);
+  }
+
+  vec2 cloudUv = p * 2.4 + vec2(uTime * 0.015, 0.0);
+  float clouds = fbm(cloudUv) + fbm(cloudUv*1.7 + 5.0) * 0.5;
+  clouds = smoothstep(0.55 - uCloudCover*0.35, 0.95, clouds);
+  float cloudMask = clamp(clouds * (0.4 + uCloudCover*0.9), 0.0, 1.0);
+  vec3 cloudColor = mix(vec3(1.0,1.0,1.0), vec3(0.6,0.63,0.68), 0.4);
+  cloudColor = mix(cloudColor*0.3, cloudColor, uIsDay);
+  col = mix(col, cloudColor, cloudMask * 0.85 * (0.35 + 0.65*uv.y));
+
+  float vig = smoothstep(1.1, 0.3, length(uv - 0.5));
+  col *= mix(0.85, 1.0, vig);
+
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+let uRes, uTime, uIsDay, uCloudCover, uTemp;
+if (gl) {
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, vertSrc));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fragSrc));
+  gl.linkProgram(prog);
+  gl.useProgram(prog);
+
+  const quad = new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(prog, 'aPos');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+  uRes = gl.getUniformLocation(prog, 'uRes');
+  uTime = gl.getUniformLocation(prog, 'uTime');
+  uIsDay = gl.getUniformLocation(prog, 'uIsDay');
+  uCloudCover = gl.getUniformLocation(prog, 'uCloudCover');
+  uTemp = gl.getUniformLocation(prog, 'uTemp');
+}
+
+let sceneState = { isDay: 1, cloudCover: 0.3, temp: 20 };
+let start = performance.now();
+function frame(now) {
+  const t = (now - start) / 1000;
+  if (gl) {
+    gl.uniform2f(uRes, canvas.width, canvas.height);
+    gl.uniform1f(uTime, t);
+    gl.uniform1f(uIsDay, sceneState.isDay);
+    gl.uniform1f(uCloudCover, sceneState.cloudCover);
+    gl.uniform1f(uTemp, sceneState.temp);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---------------- Weather code -> cloud cover / label mapping (WMO codes, Open-Meteo) ----------------
+function decodeWeatherCode(code) {
+  const map = {
+    0: { text: 'Klar', cloud: 0.05 },
+    1: { text: 'Überwiegend klar', cloud: 0.15 },
+    2: { text: 'Teilweise bewölkt', cloud: 0.45 },
+    3: { text: 'Bedeckt', cloud: 0.9 },
+    45: { text: 'Nebel', cloud: 0.85 },
+    48: { text: 'Nebel mit Reifablagerung', cloud: 0.85 },
+    51: { text: 'Leichter Nieselregen', cloud: 0.8 },
+    53: { text: 'Nieselregen', cloud: 0.85 },
+    55: { text: 'Starker Nieselregen', cloud: 0.9 },
+    61: { text: 'Leichter Regen', cloud: 0.85 },
+    63: { text: 'Regen', cloud: 0.9 },
+    65: { text: 'Starker Regen', cloud: 0.95 },
+    71: { text: 'Leichter Schneefall', cloud: 0.85 },
+    73: { text: 'Schneefall', cloud: 0.9 },
+    75: { text: 'Starker Schneefall', cloud: 0.95 },
+    80: { text: 'Regenschauer', cloud: 0.8 },
+    81: { text: 'Regenschauer', cloud: 0.85 },
+    82: { text: 'Heftige Regenschauer', cloud: 0.95 },
+    95: { text: 'Gewitter', cloud: 0.95 },
+    96: { text: 'Gewitter mit Hagel', cloud: 0.95 },
+    99: { text: 'Gewitter mit starkem Hagel', cloud: 0.98 }
+  };
+  return map[code] || { text: 'Unbekannt', cloud: 0.4 };
+}
+
+// ---------------- UI wiring ----------------
+const cityInput = document.getElementById('cityInput');
+const goBtn = document.getElementById('goBtn');
+const statusEl = document.getElementById('status');
+const hintEl = document.getElementById('hint');
+const overlayEl = document.getElementById('overlay');
+const trendEl = document.getElementById('trend');
+const placeText = document.getElementById('placeText');
+const condText = document.getElementById('condText');
+const tempText = document.getElementById('tempText');
+const rangeText = document.getElementById('rangeText');
+const trendCanvas = document.getElementById('trendCanvas');
+
+async function geocode(name) {
+  const url = 'https://geocoding-api.open-meteo.com/v1/search?name=' + encodeURIComponent(name) + '&count=1&language=de&format=json';
+  const res = await fetch(url);
+  const data = await res.json();
+  if (!data.results || data.results.length === 0) return null;
+  const r = data.results[0];
+  return { lat: r.latitude, lon: r.longitude, label: r.name + (r.country ? ', ' + r.country : '') };
+}
+
+async function fetchWeather(lat, lon) {
+  const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + lat + '&longitude=' + lon +
+    '&current=temperature_2m,weather_code,is_day' +
+    '&daily=weather_code,temperature_2m_max,temperature_2m_min' +
+    '&timezone=auto&forecast_days=7';
+  const res = await fetch(url);
+  return res.json();
+}
+
+function drawTrend(daily) {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = trendCanvas.clientWidth || trendCanvas.parentElement.clientWidth - 48;
+  const h = 150;
+  trendCanvas.width = w * dpr;
+  trendCanvas.height = h * dpr;
+  trendCanvas.style.width = w + 'px';
+  trendCanvas.style.height = h + 'px';
+  const ctx = trendCanvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  const highs = daily.temperature_2m_max;
+  const lows = daily.temperature_2m_min;
+  const days = daily.time;
+  const n = highs.length;
+
+  const allVals = highs.concat(lows);
+  const minV = Math.min(...allVals) - 2;
+  const maxV = Math.max(...allVals) + 2;
+
+  const padL = 6, padR = 6, padT = 10, padB = 24;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+
+  function x(i) { return padL + (i / (n - 1)) * plotW; }
+  function y(v) { return padT + (1 - (v - minV) / (maxV - minV)) * plotH; }
+
+  // high line
+  ctx.beginPath();
+  highs.forEach((v, i) => { const px = x(i), py = y(v); i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py); });
+  ctx.strokeStyle = 'rgba(255,190,110,0.95)';
+  ctx.lineWidth = 2.5;
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+
+  // low line
+  ctx.beginPath();
+  lows.forEach((v, i) => { const px = x(i), py = y(v); i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py); });
+  ctx.strokeStyle = 'rgba(140,190,255,0.85)';
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+
+  // points + labels
+  ctx.font = '11px -apple-system, sans-serif';
+  ctx.textAlign = 'center';
+  const dayNames = ['So','Mo','Di','Mi','Do','Fr','Sa'];
+  for (let i = 0; i < n; i++) {
+    const px = x(i);
+    ctx.fillStyle = 'rgba(255,190,110,0.95)';
+    ctx.beginPath(); ctx.arc(px, y(highs[i]), 3, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = 'rgba(140,190,255,0.85)';
+    ctx.beginPath(); ctx.arc(px, y(lows[i]), 3, 0, Math.PI*2); ctx.fill();
+
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    const d = new Date(days[i] + 'T00:00:00');
+    ctx.fillText(dayNames[d.getDay()], px, h - 6);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText(Math.round(highs[i]) + '°', px, y(highs[i]) - 8);
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.fillText(Math.round(lows[i]) + '°', px, y(lows[i]) + 16);
+  }
+}
+
+async function loadCity(name) {
+  if (!name || !name.trim()) return;
+  statusEl.textContent = 'Suche „' + name + '“ …';
+  hintEl.style.display = 'none';
+  try {
+    const geo = await geocode(name.trim());
+    if (!geo) {
+      statusEl.textContent = 'Ort nicht gefunden. Bitte anderen Namen versuchen.';
+      return;
+    }
+    statusEl.textContent = 'Lade Wetterdaten für ' + geo.label + ' …';
+    const wx = await fetchWeather(geo.lat, geo.lon);
+
+    const code = wx.current.weather_code;
+    const info = decodeWeatherCode(code);
+    const isDay = wx.current.is_day;
+    const temp = wx.current.temperature_2m;
+
+    sceneState = { isDay: isDay, cloudCover: info.cloud, temp: temp };
+
+    placeText.textContent = geo.label;
+    condText.textContent = info.text;
+    tempText.textContent = Math.round(temp) + '°';
+    rangeText.textContent = 'H ' + Math.round(wx.daily.temperature_2m_max[0]) + '° · L ' + Math.round(wx.daily.temperature_2m_min[0]) + '°';
+
+    overlayEl.style.display = 'flex';
+    trendEl.style.display = 'block';
+    drawTrend(wx.daily);
+
+    statusEl.textContent = '';
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = 'Fehler beim Laden der Wetterdaten.';
+  }
+}
+
+goBtn.addEventListener('click', () => loadCity(cityInput.value));
+cityInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') loadCity(cityInput.value); });
+
+window.addEventListener('resize', () => {
+  if (trendEl.style.display === 'block') {
+    // redraw trend on resize using last data by re-triggering with current input's city label stored
+  }
+});
+</script>
+</body>
+</html>
